@@ -1,5 +1,7 @@
-backend/.env 
-backend/.env.txt 
+.env 
+.env.txt 
 *.env 
 .venv/ 
 __pycache__/ 
+frontend/.next/ 
+frontend/node_modules/ 

@@ -1,21 +1,27 @@
 import os
 import re
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pypdf import PdfReader
 from google import genai
 from google.genai import types
+from google.auth.transport import requests as grequests
+from google.oauth2 import id_token
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Narayana AI ChatBox API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,11 +36,12 @@ if os.path.exists("college_full_knowledge.txt"):
     with open("college_full_knowledge.txt", "r", encoding="utf-8") as f:
         COLLEGE_TEXT_CONTEXT = f.read()
 
+
 def get_uploaded_docs_content():
     extracted_text = ""
     if not os.path.exists(UPLOAD_DIR):
         return extracted_text
-        
+
     for fname in os.listdir(UPLOAD_DIR):
         fpath = os.path.join(UPLOAD_DIR, fname)
         if fname.lower().endswith(".pdf"):
@@ -54,8 +61,11 @@ def get_uploaded_docs_content():
                 pass
     return extracted_text
 
-gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+
+gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
 ai_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 
 STUDENT_REGISTRY = {
     "23711A4349": {"name": "SHAIK FAROOQ AHMED", "batch": "Rejoin", "attendance": "74%"},
@@ -125,8 +135,6 @@ STUDENT_REGISTRY = {
     "24711A4362": {"name": "UGGELA MANASA", "batch": "Regular", "attendance": "79%"},
     "24711A4363": {"name": "UTUKURU HANEESH", "batch": "Regular", "attendance": "85%"},
     "24711A4364": {"name": "VARIIKUNTLA MOHANA PRIYA", "batch": "Regular", "attendance": "76%"},
-    "24711A4365": {"name": "VELAMURUI SAI SREEJA", "batch": "Regular", "attendance": "85%"},
-    "24711A4366": {"name": "YADAGIRI VENU", "batch": "Regular", "attendance": "71%"},
     "25715A4301": {"name": "ANDAGUNDA VENKATA NARAYANA", "batch": "Lateral Entry", "attendance": "88%"},
     "25715A4302": {"name": "ASAPU HARSHITH KUMAR", "batch": "Lateral Entry", "attendance": "89%"},
     "25715A4303": {"name": "KONDURU ESWARA PRASAD", "batch": "Lateral Entry", "attendance": "87%"},
@@ -134,15 +142,131 @@ STUDENT_REGISTRY = {
     "25715A4305": {"name": "NIMMALA VENKATA SAI GOWTHAM", "batch": "Lateral Entry", "attendance": "85%"},
 }
 
-DEFAULT_PASSWORD = "Necn@2025"
+# Google account -> roll number. Fill this in so students can use "Sign in with Google".
+# Emails must be lowercase. Example:
+#   "faazil@gmail.com": "24711A4350",
+STUDENT_EMAILS: Dict[str, str] = {
+}
+
+DEFAULT_PASSWORD = os.getenv("TEMP_PASSWORD", "Necn@2025")
+
+# token -> roll_number (in memory; cleared when the server restarts)
+SESSIONS: Dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# TIME TABLE (B.Tech ECA, III-I, W.E.F. 06/10/2026) - typed from the timetable image
+# ---------------------------------------------------------------------------
+IST = timezone(timedelta(hours=5, minutes=30))
+
+TIMETABLE_INFO = (
+    "Department of Electronics & Communication Engineering\n"
+    "B.Tech ECA | Class III-I | Room B-203 (Faraday's Block)\n"
+    "Academic Year 2026-27 | W.E.F. 06/10/2026"
+)
+
+LUNCH = ("12:40-01:30", "LUNCH")
+
+TIMETABLE = {
+    "MON": [
+        ("10:10-11:00", "CAO"), ("11:00-11:50", "DC"), ("11:50-12:40", "AWP"), LUNCH,
+        ("01:30-02:20", "TECHNICAL"), ("02:20-05:00", "DC/MPMC LAB"),
+    ],
+    "TUE": [
+        ("10:10-11:00", "DC"), ("11:00-11:50", "IQTA"), ("11:50-12:40", "RC-DC"), LUNCH,
+        ("01:30-02:20", "TECHNICAL"), ("02:20-03:10", "CAO"), ("03:10-04:00", "AWP"),
+        ("04:00-04:10", "BREAK"), ("04:10-05:00", "MPMC"),
+    ],
+    "WED": [
+        ("10:10-11:00", "REASONING"), ("11:00-12:40", "MPMC/DC LAB"), LUNCH,
+        ("01:30-02:20", "TECHNICAL"), ("02:20-03:10", "RC-AWP"), ("03:10-04:00", "GB"),
+        ("04:00-04:10", "BREAK"), ("04:10-05:00", "MPMC"),
+    ],
+    "THU": [
+        ("10:10-11:00", "REASONING"), ("11:00-11:50", "MPMC"), ("11:50-12:40", "DC"), LUNCH,
+        ("01:30-02:20", "COMM SKILLS"), ("02:20-03:10", "VERBAL"), ("03:10-05:00", "PCB"),
+    ],
+    "FRI": [
+        ("10:10-11:00", "DC"), ("11:00-12:40", "TINKERING LAB"), LUNCH,
+        ("01:30-02:20", "MPMC"), ("02:20-03:10", "CAO"), ("03:10-04:00", "APTITUDE"),
+        ("04:00-04:10", "BREAK"), ("04:10-05:00", "REASONING"),
+    ],
+    "SAT": [
+        ("10:10-11:00", "GB"), ("11:00-11:50", "TECHNICAL"), ("11:50-12:40", "APTITUDE"), LUNCH,
+        ("01:30-02:20", "AWP"), ("02:20-03:10", "IQTA"), ("03:10-04:00", "CAO"),
+        ("04:00-04:10", "BREAK"), ("04:10-05:00", "RC-MPMC"),
+    ],
+}
+
+DAY_NAMES = {
+    "MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday", "THU": "Thursday",
+    "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday",
+}
+DAY_ORDER = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+DAY_PATTERNS = {
+    "MON": r"\bmon(day)?\b", "TUE": r"\btue(s|sday)?\b", "WED": r"\bwed(nesday)?\b",
+    "THU": r"\bthu(r|rs|rsday)?\b", "FRI": r"\bfri(day)?\b", "SAT": r"\bsat(urday)?\b",
+    "SUN": r"\bsun(day)?\b",
+}
+
+SUBJECTS_TEXT = """Subjects and faculty (B.Tech ECA, III-I):
+1. Microprocessors and Microcontrollers (MPMC) - 23EC2008 - Mr. T. Murali Krishna
+2. Digital Communication (DC) - 23AC2002 - Mr. G. Gopi
+3. Antenna and Wave Propagation (AWP) - 23EC2007 - Dr. K. S. Sagar Reddy
+4. Computer Architecture and Organization (CAO) - 23EC4001 - Mr. P. Sravan Kumar Reddy
+5. Sustainable Materials and Green Buildings (MOOCS) (GB) - 23CE3009 - Mrs. G. Shobana
+6. Introduction to Quantum Technologies and Applications (IQTA) - 23ES1014 - Dr. K. Murali
+7. Microprocessors and Microcontrollers Lab - 23EC2505 - Mr. T. Murali Krishna
+8. Digital Communication Lab - 23AC2502 - Mrs. Syed Athika Sultana
+9. Tinkering Lab - 23ES1507 - Dr. K. S. Sagar Reddy / Mr. A. Benjamin Paul
+10. PCB Design and Prototype Development (PCB) - 23SC6110 - Ms. T. Rajitha / Mrs. V. Srilatha
+11. Aptitude / Reasoning / Verbal
+Class Incharge: Mr. V. Praveen Kumar"""
+
+
+def detect_day(q: str) -> Optional[str]:
+    now = datetime.now(IST)
+    if "tomorrow" in q:
+        return DAY_ORDER[(now.weekday() + 1) % 7]
+    if "today" in q:
+        return DAY_ORDER[now.weekday()]
+    for key, pattern in DAY_PATTERNS.items():
+        if re.search(pattern, q):
+            return key
+    return None
+
+
+def format_day(day: str) -> str:
+    if day not in TIMETABLE:
+        return f"{DAY_NAMES.get(day, day)}: no classes (holiday)."
+    lines = [f"{t}   {s}" for t, s in TIMETABLE[day]]
+    return f"{DAY_NAMES[day]} time table:\n" + "\n".join(lines)
+
+
+def answer_timetable(q: str) -> Optional[str]:
+    if re.search(r"faculty|teacher|professor|subject code|subjects|in-?charge", q):
+        return SUBJECTS_TEXT
+    if not re.search(r"time\s*-?\s*table|timetable|\bperiods?\b|\bclasses\b", q):
+        return None
+    day = detect_day(q)
+    if day:
+        return TIMETABLE_INFO + "\n\n" + format_day(day)
+    blocks = [format_day(d) for d in DAY_ORDER if d in TIMETABLE]
+    return TIMETABLE_INFO + "\n\n" + "\n\n".join(blocks) + "\n\nAsk for a day, e.g. \"time table today\" or \"friday time table\"."
+
 
 class LoginRequest(BaseModel):
     roll_number: str
     password: str
 
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
+
 class ChatRequest(BaseModel):
     message: str
-    roll_number: str
+    roll_number: Optional[str] = None  # ignored; identity comes from the login token
+
 
 def get_student_profile(roll_no: str):
     roll = roll_no.strip().upper()
@@ -165,13 +289,31 @@ def get_student_profile(roll_no: str):
             "DC": f"{min(30, 20 + (num % 10))}/30",
             "MPMC": f"{min(30, 21 + ((num * 3) % 10))}/30",
             "VLSI": f"{min(30, 22 + ((num * 2) % 9))}/30",
-            "AWP": f"{min(30, 19 + ((num * 4) % 11))}/30"
-        }
+            "AWP": f"{min(30, 19 + ((num * 4) % 11))}/30",
+        },
     }
+
+
+def create_session(roll: str) -> str:
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = roll
+    return token
+
+
+def get_current_roll(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing login token. Please sign in again.")
+    token = authorization.split(" ", 1)[1].strip()
+    roll = SESSIONS.get(token)
+    if not roll or roll not in STUDENT_REGISTRY:
+        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    return roll
+
 
 @app.get("/")
 def read_root():
     return {"status": "Online", "system": "Narayana AI ChatBox ECE-ACT Backend Active"}
+
 
 @app.post("/api/login")
 def student_login(req: LoginRequest):
@@ -181,96 +323,142 @@ def student_login(req: LoginRequest):
     if roll not in STUDENT_REGISTRY:
         raise HTTPException(status_code=401, detail="Roll Number not found in ECE-ACT database.")
 
-    if pwd != DEFAULT_PASSWORD:
+    if not secrets.compare_digest(pwd, DEFAULT_PASSWORD):
         raise HTTPException(status_code=401, detail="Incorrect Password. Default is Necn@2025.")
 
     student = get_student_profile(roll)
     return {
         "success": True,
         "message": f"Welcome {student['name']}!",
-        "student": student
+        "student": student,
+        "token": create_session(roll),
     }
 
-@app.post("/api/chat")
-def handle_chat(req: ChatRequest):
-    query = req.message.lower().strip()
-    roll = req.roll_number.strip().upper()
-    student = get_student_profile(roll)
 
-    # 1. Database Metric Direct Matches
+@app.post("/api/google-login")
+def google_login(req: GoogleLoginRequest):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not set in backend/.env")
+
+    try:
+        info = id_token.verify_oauth2_token(req.credential, grequests.Request(), GOOGLE_CLIENT_ID)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Google token.")
+
+    if not info.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email is not verified.")
+
+    roll = STUDENT_EMAILS.get(info["email"].strip().lower())
+    if not roll or roll not in STUDENT_REGISTRY:
+        raise HTTPException(
+            status_code=403,
+            detail="This Google account is not linked to any student. Sign in with your PIN instead.",
+        )
+
+    student = get_student_profile(roll)
+    return {
+        "success": True,
+        "message": f"Welcome {student['name']}!",
+        "student": student,
+        "token": create_session(roll),
+    }
+
+
+@app.post("/api/chat")
+def handle_chat(req: ChatRequest, authorization: Optional[str] = Header(default=None)):
+    roll = get_current_roll(authorization)
+    student = get_student_profile(roll)
+    query = req.message.lower().strip()
+
+    # 1. Local Database Lookup
     if "mark" in query or "mid score" in query or "score" in query:
-        marks_str = "\n".join([f"• **{sub}**: {score}" for sub, score in student["marks"].items()])
+        marks_str = "\n".join([f"• {sub}: {score}" for sub, score in student["marks"].items()])
         return {
-            "response": f"📝 **Mid Exam Scores for {student['name']} ({roll}):**\n\n{marks_str}\n\n*Source: Retrieved from ECE-ACT Academic Database*",
+            "response": f"📝 Mid Exam Scores for {student['name']} ({roll}):\n\n{marks_str}",
             "file_url": None,
-            "is_image": False
+            "is_image": False,
         }
 
     if "attendance" in query:
         return {
-            "response": f"📊 **Attendance status for {student['name']} ({roll}) up to Sep 19, 2026:** {student['attendance']}\n\n*Source: Retrieved from ECE-ACT Attendance Register*",
+            "response": f"📊 Attendance status for {student['name']} ({roll}): {student['attendance']}",
             "file_url": None,
-            "is_image": False
+            "is_image": False,
         }
 
     if "profile" in query or "who am i" in query:
         return {
-            "response": f"👤 **Student Record:**\n• Name: {student['name']}\n• PIN Number: {roll}\n• Department: {student['branch']}\n• Attendance (Up to Sep 19, 2026): {student['attendance']}\n\n*Source: Retrieved from Student Registry Database*",
+            "response": (
+                f"👤 Student Record:\n• Name: {student['name']}\n• PIN Number: {roll}\n"
+                f"• Department: {student['branch']}\n• Attendance: {student['attendance']}"
+            ),
             "file_url": None,
-            "is_image": False
+            "is_image": False,
         }
 
-    # 2. Gather Document Context
+    timetable_reply = answer_timetable(query)
+    if timetable_reply:
+        return {"response": timetable_reply, "file_url": None, "is_image": False}
+
+    # 2. Document Context Parsing
     uploaded_docs_text = get_uploaded_docs_content()
 
-    # 3. Chat Session using Chat interface for AFC
+    full_prompt = f"""
+You are Narayana AI ChatBox for ECE-ACT department at Narayana Engineering College, Nellore.
+Student: {student['name']} (PIN: {roll})
+
+INTERNAL DATABASE & UPLOADED FILES:
+{uploaded_docs_text[:8000] if uploaded_docs_text else "No uploaded class documents."}
+
+COLLEGE KNOWLEDGE BASE:
+{COLLEGE_TEXT_CONTEXT[:8000] if COLLEGE_TEXT_CONTEXT else "No college knowledge context."}
+
+INSTRUCTIONS:
+1. First, check if the student's question can be directly answered using the INTERNAL DATABASE or UPLOADED FILES provided above.
+2. If the answer is present in internal files, answer directly using that information.
+3. If NOT found in internal files, perform a web search to provide a clear, detailed, and accurate answer.
+4. Do NOT output metadata like "Source: Google Search" or "Here is the answer for...". Provide a direct, professional response.
+5. Use plain text only, without markdown symbols such as ** or #.
+
+STUDENT QUESTION:
+{req.message}
+"""
+
+    # 3. Gemini API with Google Search grounding
+    # Set GEMINI_MODELS in .env (comma separated) to change these without editing code
+    ACTIVE_MODELS = [
+        m.strip()
+        for m in os.getenv(
+            "GEMINI_MODELS",
+            "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-flash-lite-latest",
+        ).split(",")
+        if m.strip()
+    ]
+
     if ai_client:
-        prompt = f"""
-        You are Narayana AI ChatBox for the ECE-ACT department at Narayana Engineering College, Nellore.
-        Logged-in Student: {student['name']} (PIN: {roll})
-
-        INTERNAL DATABASE & UPLOADED FILES:
-        {uploaded_docs_text[:10000] if uploaded_docs_text else "No uploaded class documents."}
-
-        COLLEGE KNOWLEDGE BASE:
-        {COLLEGE_TEXT_CONTEXT[:10000] if COLLEGE_TEXT_CONTEXT else "No college knowledge context."}
-
-        STUDENT QUESTION:
-        {req.message}
-
-        INSTRUCTIONS:
-        1. If the question relates to the uploaded documents or college knowledge base, answer using that information and append:
-           "\n\n*Source: Retrieved from Internal Database / Uploaded Class Documents*"
-        2. If the question is a general question (physics, Newton's laws, quantum, coding, general knowledge), search Google to answer accurately. At the very end of your response, append:
-           "\n\n*Source: Answer retrieved via Google Search*"
-        """
-
-        try:
-            chat = ai_client.chats.create(
-                model="gemini-2.5-flash",
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())]
-                )
-            )
-            res = chat.send_message(prompt)
-            if res and res.text:
-                return {"response": res.text, "file_url": None, "is_image": False}
-        except Exception:
+        for model_name in ACTIVE_MODELS:
             try:
                 res = ai_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt
+                    model=model_name,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())]
+                    ),
                 )
                 if res and res.text:
-                    text_resp = res.text
-                    if "*Source:" not in text_resp:
-                        text_resp += "\n\n*Source: Answer retrieved via Google Search*"
-                    return {"response": text_resp, "file_url": None, "is_image": False}
-            except Exception:
-                pass
+                    return {"response": res.text, "file_url": None, "is_image": False}
+            except Exception as e:
+                print(f"[Gemini] {model_name} with Google Search failed: {e}")
+                try:
+                    res = ai_client.models.generate_content(model=model_name, contents=full_prompt)
+                    if res and res.text:
+                        return {"response": res.text, "file_url": None, "is_image": False}
+                except Exception as e2:
+                    print(f"[Gemini] {model_name} without search failed: {e2}")
+                    continue
 
     return {
-        "response": f"Here is the answer for **{req.message}**:\n\n• General queries are answered dynamically via web search integration.\n\n*Source: Answer retrieved via Google Search*",
+        "response": f"Answers for '{req.message}' could not be fetched right now. Please verify that your GEMINI_API_KEY is set in backend/.env.",
         "file_url": None,
-        "is_image": False
+        "is_image": False,
     }
